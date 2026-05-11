@@ -1,0 +1,513 @@
+#include "imu_bmi270.h"
+#include "bmi270.h"
+#include "bmi270_defs.h"
+#include "esp_log.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "driver/spi_master.h"
+#include "driver/gpio.h"
+
+#define TAG "BMI270 IMU"
+
+// BMI270 设备结构体定义
+struct Bmi270Imu::Bmi270Device {
+    bmi2_dev bmi2;
+    Bmi270Imu* imu;
+};
+
+Bmi270Imu::Bmi270Imu(spi_host_device_t spi_host, gpio_num_t cs_pin, 
+                     gpio_num_t int1_pin, gpio_num_t int2_pin)
+    : spi_host_(spi_host)
+    , cs_pin_(cs_pin)
+    , int1_pin_(int1_pin)
+    , int2_pin_(int2_pin)
+    , spi_device_(nullptr)
+    , bmi270_dev_(nullptr)
+    , chip_id_(0)
+    , initialized_(false)
+    , interrupt_task_handle_(nullptr)
+    , interrupt_flags_(0) {
+}
+
+Bmi270Imu::~Bmi270Imu() {
+    if (interrupt_task_handle_) {
+        vTaskDelete(interrupt_task_handle_);
+    }
+    
+    if (initialized_) {
+        // 禁用所有中断
+        EnableInterrupt(INTERRUPT_ANY_MOTION, false);
+        EnableInterrupt(INTERRUPT_SINGLE_TAP, false);
+        EnableInterrupt(INTERRUPT_DOUBLE_TAP, false);
+        
+        // 移除 GPIO 中断
+        gpio_isr_handler_remove(int1_pin_);
+        gpio_isr_handler_remove(int2_pin_);
+    }
+    
+    delete bmi270_dev_;
+    
+    if (spi_device_) {
+        spi_bus_remove_device(spi_device_);
+    }
+}
+
+int8_t Bmi270Imu::SpiRead(uint8_t reg_addr, uint8_t* reg_data, uint32_t len, void* intf_ptr) {
+    Bmi270Device* dev = static_cast<Bmi270Device*>(intf_ptr);
+    if (!dev || !dev->imu) {
+        return BMI2_E_NULL_PTR;
+    }
+    
+    spi_transaction_t trans = {};
+    trans.addr = reg_addr | 0x80;  // 设置读取位
+    trans.length = 8 * len;
+    trans.rxlength = 8 * len;
+    trans.rx_buffer = reg_data;
+    trans.flags = SPI_TRANS_USE_RXDATA;
+    
+    esp_err_t ret = spi_device_transmit(dev->imu->spi_device_, &trans);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SPI read failed: %s", esp_err_to_name(ret));
+        return BMI2_E_COM_FAIL;
+    }
+    
+    return BMI2_OK;
+}
+
+int8_t Bmi270Imu::SpiWrite(uint8_t reg_addr, const uint8_t* reg_data, uint32_t len, void* intf_ptr) {
+    Bmi270Device* dev = static_cast<Bmi270Device*>(intf_ptr);
+    if (!dev || !dev->imu) {
+        return BMI2_E_NULL_PTR;
+    }
+    
+    spi_transaction_t trans = {};
+    trans.addr = reg_addr & 0x7F;  // 清除读取位
+    trans.length = 8 * len;
+    trans.tx_buffer = reg_data;
+    trans.flags = SPI_TRANS_USE_TXDATA;
+    
+    esp_err_t ret = spi_device_transmit(dev->imu->spi_device_, &trans);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SPI write failed: %s", esp_err_to_name(ret));
+        return BMI2_E_COM_FAIL;
+    }
+    
+    return BMI2_OK;
+}
+
+void Bmi270Imu::DelayUs(uint32_t period, void* intf_ptr) {
+    ets_delay_us(period);
+}
+
+bool Bmi270Imu::SetupSpi() {
+    spi_device_interface_config_t dev_cfg = {};
+    dev_cfg.command_bits = 0;
+    dev_cfg.address_bits = 8;
+    dev_cfg.dummy_bits = 0;
+    dev_cfg.mode = 3;  // SPI mode 3
+    dev_cfg.clock_speed_hz = 10 * 1000 * 1000;  // 10 MHz
+    dev_cfg.spics_io_num = cs_pin_;
+    dev_cfg.queue_size = 1;
+    dev_cfg.flags = SPI_DEVICE_HALFDUPLEX;
+    dev_cfg.pre_cb = nullptr;
+    
+    esp_err_t ret = spi_bus_add_device(spi_host_, &dev_cfg, &spi_device_);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to add SPI device: %s", esp_err_to_name(ret));
+        return false;
+    }
+    
+    return true;
+}
+
+void Bmi270Imu::ISRHandlerInt1(void* arg) {
+    Bmi270Imu* imu = static_cast<Bmi270Imu*>(arg);
+    if (imu) {
+        imu->interrupt_flags_ |= INTERRUPT_ANY_MOTION;
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        vTaskNotifyGiveFromISR(imu->interrupt_task_handle_, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+}
+
+void Bmi270Imu::ISRHandlerInt2(void* arg) {
+    Bmi270Imu* imu = static_cast<Bmi270Imu*>(arg);
+    if (imu) {
+        imu->interrupt_flags_ |= INTERRUPT_SINGLE_TAP | INTERRUPT_DOUBLE_TAP;
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        vTaskNotifyGiveFromISR(imu->interrupt_task_handle_, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+}
+
+void Bmi270Imu::InterruptTask(void* arg) {
+    Bmi270Imu* imu = static_cast<Bmi270Imu*>(arg);
+    
+    while (1) {
+        // 等待中断通知
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        
+        uint8_t flags = imu->interrupt_flags_;
+        imu->interrupt_flags_ = 0;
+        
+        std::lock_guard<std::mutex> lock(imu->callback_mutex_);
+        if (imu->interrupt_callback_) {
+            if (flags & INTERRUPT_ANY_MOTION) {
+                imu->interrupt_callback_(INTERRUPT_ANY_MOTION);
+            }
+            if (flags & INTERRUPT_SINGLE_TAP) {
+                imu->interrupt_callback_(INTERRUPT_SINGLE_TAP);
+            }
+            if (flags & INTERRUPT_DOUBLE_TAP) {
+                imu->interrupt_callback_(INTERRUPT_DOUBLE_TAP);
+            }
+        }
+    }
+}
+
+bool Bmi270Imu::SetupInterrupts() {
+    // 配置 GPIO
+    gpio_config_t int1_config = {};
+    int1_config.intr_type = GPIO_INTR_POSEDGE;
+    int1_config.pin_bit_mask = (1ULL << int1_pin_);
+    int1_config.mode = GPIO_MODE_INPUT;
+    int1_config.pull_up_en = GPIO_PULLUP_ENABLE;
+    gpio_config(&int1_config);
+    
+    gpio_config_t int2_config = {};
+    int2_config.intr_type = GPIO_INTR_POSEDGE;
+    int2_config.pin_bit_mask = (1ULL << int2_pin_);
+    int2_config.mode = GPIO_MODE_INPUT;
+    int2_config.pull_up_en = GPIO_PULLUP_ENABLE;
+    gpio_config(&int2_config);
+    
+    // 安装 ISR 服务
+    gpio_install_isr_service(0);
+    
+    // 注册中断处理程序
+    gpio_isr_handler_add(int1_pin_, ISRHandlerInt1, this);
+    gpio_isr_handler_add(int2_pin_, ISRHandlerInt2, this);
+    
+    // 创建中断处理任务
+    xTaskCreate(InterruptTask, "bmi270_int", 4096, this, 5, &interrupt_task_handle_);
+    
+    return true;
+}
+
+bool Bmi270Imu::ConfigureInterruptPins() {
+    if (!bmi270_dev_) return false;
+    
+    // 配置 INT1 引脚
+    struct bmi2_int_pin_config int_cfg = {};
+    int_cfg.pin_type = BMI2_INT1;
+    int_cfg.int_latch = BMI2_INT_NON_LATCH;
+    int_cfg.pin_cfg[0].lvl = BMI2_INT_ACTIVE_HIGH;
+    int_cfg.pin_cfg[0].od = BMI2_INT_PUSH_PULL;
+    int_cfg.pin_cfg[0].output_en = BMI2_INT_OUTPUT_ENABLE;
+    int_cfg.pin_cfg[0].input_en = BMI2_INT_INPUT_DISABLE;
+    
+    int8_t rslt = bmi270_set_int_pin_config(&int_cfg, &bmi270_dev_->bmi2);
+    if (rslt != BMI2_OK) {
+        ESP_LOGE(TAG, "Failed to configure INT1 pin: %d", rslt);
+        return false;
+    }
+    
+    return true;
+}
+
+bool Bmi270Imu::ConfigureSensors() {
+    if (!bmi270_dev_) return false;
+    
+    // 启用加速度计
+    uint8_t sens_list[2] = {BMI2_ACCEL, BMI2_GYRO};
+    int8_t rslt = bmi270_sensor_enable(sens_list, 2, &bmi270_dev_->bmi2);
+    if (rslt != BMI2_OK) {
+        ESP_LOGE(TAG, "Failed to enable sensors: %d", rslt);
+        return false;
+    }
+    
+    // 配置加速度计
+    struct bmi2_sens_config accel_cfg = {};
+    accel_cfg.type = BMI2_ACCEL;
+    accel_cfg.cfg.acc.odr = BMI2_ACC_ODR_100HZ;
+    accel_cfg.cfg.acc.bwp = BMI2_ACC_OSR4_AVG1;
+    accel_cfg.cfg.acc.filter_perf = BMI2_PERF_OPT_MODE;
+    accel_cfg.cfg.acc.range = BMI2_ACC_RANGE_4G;
+    
+    rslt = bmi270_set_sensor_config(&accel_cfg, 1, &bmi270_dev_->bmi2);
+    if (rslt != BMI2_OK) {
+        ESP_LOGE(TAG, "Failed to configure accelerometer: %d", rslt);
+        return false;
+    }
+    
+    return true;
+}
+
+bool Bmi270Imu::Initialize() {
+    if (initialized_) {
+        ESP_LOGW(TAG, "BMI270 already initialized");
+        return true;
+    }
+    
+    // 1. 设置 SPI
+    if (!SetupSpi()) {
+        return false;
+    }
+    
+    // 2. 创建设备结构
+    bmi270_dev_ = new Bmi270Device();
+    if (!bmi270_dev_) {
+        ESP_LOGE(TAG, "Failed to allocate BMI270 device");
+        return false;
+    }
+    
+    bmi270_dev_->imu = this;
+    
+    // 3. 初始化 BMI270
+    bmi270_dev_->bmi2.intf = BMI2_SPI_INTF;
+    bmi270_dev_->bmi2.read = SpiRead;
+    bmi270_dev_->bmi2.write = SpiWrite;
+    bmi270_dev_->bmi2.delay_us = DelayUs;
+    bmi270_dev_->bmi2.intf_ptr = bmi270_dev_;
+    bmi270_dev_->bmi2.read_write_len = 30;
+    
+    int8_t rslt = bmi270_init(&bmi270_dev_->bmi2);
+    if (rslt != BMI2_OK) {
+        ESP_LOGE(TAG, "BMI270 init failed: %d", rslt);
+        delete bmi270_dev_;
+        bmi270_dev_ = nullptr;
+        return false;
+    }
+    
+    chip_id_ = bmi270_dev_->bmi2.chip_id;
+    ESP_LOGI(TAG, "BMI270 initialized, Chip ID: 0x%X", chip_id_);
+    
+    // 4. 配置传感器
+    if (!ConfigureSensors()) {
+        ESP_LOGE(TAG, "Failed to configure sensors");
+        delete bmi270_dev_;
+        bmi270_dev_ = nullptr;
+        return false;
+    }
+    
+    // 5. 配置中断引脚
+    if (!ConfigureInterruptPins()) {
+        ESP_LOGW(TAG, "Failed to configure interrupt pins, interrupts may not work");
+    }
+    
+    // 6. 设置中断
+    if (!SetupInterrupts()) {
+        ESP_LOGW(TAG, "Failed to setup interrupts");
+    }
+    
+    initialized_ = true;
+    ESP_LOGI(TAG, "BMI270 initialization complete");
+    return true;
+}
+
+void Bmi270Imu::SetInterruptCallback(InterruptCallback callback) {
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    interrupt_callback_ = callback;
+}
+
+bool Bmi270Imu::EnableInterrupt(InterruptType type, bool enable) {
+    if (!bmi270_dev_ || !initialized_) {
+        return false;
+    }
+    
+    int8_t rslt = BMI2_OK;
+    
+    switch (type) {
+        case INTERRUPT_ANY_MOTION: {
+            struct bmi2_sens_config any_motion_cfg = {};
+            any_motion_cfg.type = BMI2_ANY_MOTION;
+            any_motion_cfg.cfg.any_motion.enable = enable ? BMI2_ENABLE : BMI2_DISABLE;
+            any_motion_cfg.cfg.any_motion.duration = 0x01;
+            any_motion_cfg.cfg.any_motion.threshold = 0x0A;
+            
+            rslt = bmi270_set_sensor_config(&any_motion_cfg, 1, &bmi270_dev_->bmi2);
+            break;
+        }
+            
+        case INTERRUPT_SINGLE_TAP: {
+            struct bmi2_sens_config tap_cfg = {};
+            tap_cfg.type = BMI2_SINGLE_TAP;
+            tap_cfg.cfg.tap.enable = enable ? BMI2_ENABLE : BMI2_DISABLE;
+            tap_cfg.cfg.tap.sensitivity = BMI2_TAP_SENSITIVITY_0;
+            
+            rslt = bmi270_set_sensor_config(&tap_cfg, 1, &bmi270_dev_->bmi2);
+            break;
+        }
+            
+        case INTERRUPT_DOUBLE_TAP: {
+            struct bmi2_sens_config double_tap_cfg = {};
+            double_tap_cfg.type = BMI2_DOUBLE_TAP;
+            double_tap_cfg.cfg.double_tap.enable = enable ? BMI2_ENABLE : BMI2_DISABLE;
+            double_tap_cfg.cfg.double_tap.sensitivity = BMI2_DOUBLE_TAP_SENSITIVITY_0;
+            
+            rslt = bmi270_set_sensor_config(&double_tap_cfg, 1, &bmi270_dev_->bmi2);
+            break;
+        }
+            
+        default:
+            ESP_LOGE(TAG, "Unknown interrupt type: %d", type);
+            return false;
+    }
+    
+    if (rslt != BMI2_OK) {
+        ESP_LOGE(TAG, "Failed to %s interrupt type %d: %d", 
+                enable ? "enable" : "disable", type, rslt);
+        return false;
+    }
+    
+    // 映射中断到引脚
+    if (enable) {
+        uint8_t map_int = 0;
+        if (type == INTERRUPT_ANY_MOTION) {
+            map_int = 1 << 5;  // BMI2_ANY_MOT_SEL
+        } else if (type == INTERRUPT_SINGLE_TAP) {
+            map_int = 1 << 6;  // BMI2_SINGLE_TAP_SEL
+        } else if (type == INTERRUPT_DOUBLE_TAP) {
+            map_int = 1 << 7;  // BMI2_DOUBLE_TAP_SEL
+        }
+        
+        rslt = bmi270_map_data_int(BMI2_DRDY_INT, &map_int, &bmi270_dev_->bmi2);
+        if (rslt != BMI2_OK) {
+            ESP_LOGW(TAG, "Failed to map interrupt: %d", rslt);
+        }
+    }
+    
+    return true;
+}
+
+bool Bmi270Imu::SetAccelerometerRange(uint8_t range) {
+    if (!bmi270_dev_ || !initialized_) {
+        return false;
+    }
+    
+    uint8_t bmi_range;
+    switch (range) {
+        case 2: bmi_range = BMI2_ACC_RANGE_2G; break;
+        case 4: bmi_range = BMI2_ACC_RANGE_4G; break;
+        case 8: bmi_range = BMI2_ACC_RANGE_8G; break;
+        case 16: bmi_range = BMI2_ACC_RANGE_16G; break;
+        default:
+            ESP_LOGE(TAG, "Invalid accelerometer range: %d", range);
+            return false;
+    }
+    
+    struct bmi2_sens_config accel_cfg = {};
+    accel_cfg.type = BMI2_ACCEL;
+    accel_cfg.cfg.acc.range = bmi_range;
+    
+    int8_t rslt = bmi270_set_sensor_config(&accel_cfg, 1, &bmi270_dev_->bmi2);
+    if (rslt != BMI2_OK) {
+        ESP_LOGE(TAG, "Failed to set accelerometer range: %d", rslt);
+        return false;
+    }
+    
+    return true;
+}
+
+bool Bmi270Imu::SetAnyMotionConfig(uint16_t duration, uint8_t threshold) {
+    if (!bmi270_dev_ || !initialized_) {
+        return false;
+    }
+    
+    struct bmi2_sens_config any_motion_cfg = {};
+    any_motion_cfg.type = BMI2_ANY_MOTION;
+    any_motion_cfg.cfg.any_motion.duration = duration;
+    any_motion_cfg.cfg.any_motion.threshold = threshold;
+    
+    int8_t rslt = bmi270_set_sensor_config(&any_motion_cfg, 1, &bmi270_dev_->bmi2);
+    if (rslt != BMI2_OK) {
+        ESP_LOGE(TAG, "Failed to set any motion config: %d", rslt);
+        return false;
+    }
+    
+    return true;
+}
+
+bool Bmi270Imu::SetTapConfig(bool single_tap_enable, bool double_tap_enable, uint8_t sensitivity) {
+    if (!bmi270_dev_ || !initialized_) {
+        return false;
+    }
+    
+    int8_t rslt = BMI2_OK;
+    
+    if (single_tap_enable) {
+        struct bmi2_sens_config tap_cfg = {};
+        tap_cfg.type = BMI2_SINGLE_TAP;
+        tap_cfg.cfg.tap.enable = BMI2_ENABLE;
+        tap_cfg.cfg.tap.sensitivity = (sensitivity < 4) ? sensitivity : 0;
+        
+        rslt = bmi270_set_sensor_config(&tap_cfg, 1, &bmi270_dev_->bmi2);
+        if (rslt != BMI2_OK) {
+            ESP_LOGE(TAG, "Failed to set single tap config: %d", rslt);
+            return false;
+        }
+    }
+    
+    if (double_tap_enable) {
+        struct bmi2_sens_config double_tap_cfg = {};
+        double_tap_cfg.type = BMI2_DOUBLE_TAP;
+        double_tap_cfg.cfg.double_tap.enable = BMI2_ENABLE;
+        double_tap_cfg.cfg.double_tap.sensitivity = (sensitivity < 4) ? sensitivity : 0;
+        
+        rslt = bmi270_set_sensor_config(&double_tap_cfg, 1, &bmi270_dev_->bmi2);
+        if (rslt != BMI2_OK) {
+            ESP_LOGE(TAG, "Failed to set double tap config: %d", rslt);
+            return false;
+        }
+    }
+    
+    return true;
+}
+
+bool Bmi270Imu::ReadAccelerometer(float& x, float& y, float& z) {
+    if (!bmi270_dev_ || !initialized_) {
+        return false;
+    }
+    
+    struct bmi2_sens_data sensor_data = {};
+    sensor_data.acc.x = 0;
+    sensor_data.acc.y = 0;
+    sensor_data.acc.z = 0;
+    
+    int8_t rslt = bmi270_get_sensor_data(&sensor_data, &bmi270_dev_->bmi2);
+    if (rslt != BMI2_OK) {
+        ESP_LOGE(TAG, "Failed to read accelerometer data: %d", rslt);
+        return false;
+    }
+    
+    x = sensor_data.acc.x;
+    y = sensor_data.acc.y;
+    z = sensor_data.acc.z;
+    
+    return true;
+}
+
+bool Bmi270Imu::ReadGyroscope(float& x, float& y, float& z) {
+    if (!bmi270_dev_ || !initialized_) {
+        return false;
+    }
+    
+    struct bmi2_sens_data sensor_data = {};
+    sensor_data.gyr.x = 0;
+    sensor_data.gyr.y = 0;
+    sensor_data.gyr.z = 0;
+    
+    int8_t rslt = bmi270_get_sensor_data(&sensor_data, &bmi270_dev_->bmi2);
+    if (rslt != BMI2_OK) {
+        ESP_LOGE(TAG, "Failed to read gyroscope data: %d", rslt);
+        return false;
+    }
+    
+    x = sensor_data.gyr.x;
+    y = sensor_data.gyr.y;
+    z = sensor_data.gyr.z;
+    
+    return true;
+}
