@@ -134,4 +134,4 @@ dependencies:
   ## Required IDF version
   idf:
     version: '>=5.5.2'
-  espressif/bmi270: ^1.0.1
+  espp/bmi270: ^1.0.34

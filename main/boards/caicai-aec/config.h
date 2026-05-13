@@ -21,7 +21,8 @@
 #define AUDIO_CODEC_ES8311_ADDR         ES8311_CODEC_DEFAULT_ADDR
 #define AUDIO_CODEC_ES7210_ADDR         0x82
 
-#define IMU_SPI_HOST                    SPI3_HOST
+// #define IMU_I2C_SCL_PIN                 GPIO_NUM_16
+// #define IMU_I2C_SDA_PIN                 GPIO_NUM_17
 #define IMU_SPI_MISO_PIN                GPIO_NUM_16
 #define IMU_SPI_MOSI_PIN                GPIO_NUM_17
 #define IMU_SPI_SCK_PIN                 GPIO_NUM_18

@@ -12,17 +12,16 @@
 #include "sleep_timer.h"
 #include "led/single_led.h"
 
-// #include "imu_bmi270.h"
-
 #include <esp_log.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_common.h>
-// #include <esp_lcd_panel_vender.h>
-// #include <esp_lcd_panel_io.h>
-// #include <esp_lcd_panel_ops.h>
+#include <esp_lcd_panel_io.h>
+#include <esp_lcd_panel_ops.h>
 #include <esp_lcd_st77916.h>
 #include <driver/rtc_io.h>
+#include <driver/gpio.h>
 #include <esp_sleep.h>
+
 
 
 #define TAG "CaiCaiAECBoard"
@@ -217,9 +216,10 @@ static const st77916_lcd_init_cmd_t lcd_init_cmds[] = {
 
 class CaiCaiAECBoard : public WifiBoard {
 private:
-    i2c_master_bus_handle_t codec_i2c_bus_;
-    // Bmi270Imu* imu_ = nullptr;
+    i2c_master_bus_handle_t codec_i2c_bus_, imu_i2c_bus_;
+    espp::Bmi270<>* imu_;
     Button boot_button_;
+    Button *any_motion_button_, *tap_button_;
     Display* display_;
 
     PowerSaveTimer* power_save_timer_ = nullptr;
@@ -264,7 +264,7 @@ private:
     void InitializeI2c() {
         // Initialize I2C peripheral
         i2c_master_bus_config_t i2c_bus_cfg = {
-            .i2c_port = (i2c_port_t)1,
+            .i2c_port = (i2c_port_t)I2C_NUM_0,
             .sda_io_num = AUDIO_CODEC_I2C_SDA_PIN,
             .scl_io_num = AUDIO_CODEC_I2C_SCL_PIN,
             .clk_source = I2C_CLK_SRC_DEFAULT,
@@ -276,10 +276,24 @@ private:
             },
         };
         ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &codec_i2c_bus_));
+
+        // // 2. 新增 BMI270 的 I2C 总线初始化 (I2C_NUM_1)
+        // i2c_master_bus_config_t bmi270_i2c_bus_cfg = {
+        //     .i2c_port = (i2c_port_t)I2C_NUM_1,
+        //     .sda_io_num = IMU_I2C_SDA_PIN,
+        //     .scl_io_num = IMU_I2C_SCL_PIN,
+        //     .clk_source = I2C_CLK_SRC_DEFAULT,
+        //     .glitch_ignore_cnt = 7,
+        //     .intr_priority = 0,
+        //     .trans_queue_depth = 0,
+        //     .flags = {
+        //         .enable_internal_pullup = 1,
+        //     },
+        // };
+        // ESP_ERROR_CHECK(i2c_new_master_bus(&bmi270_i2c_bus_cfg, &imu_i2c_bus_));
     }
 
     void InitializeSpi() {
-        ESP_LOGI(TAG, "Initialize Screen SPI bus");
         const spi_bus_config_t screen_bus_config = MOJI2_ST77916_PANEL_BUS_QSPI_CONFIG(DISPLAY_QSPI_SCLK_PIN,
                                                                                     DISPLAY_QSPI_D0_PIN,
                                                                                     DISPLAY_QSPI_D1_PIN,
@@ -287,7 +301,6 @@ private:
                                                                                     DISPLAY_QSPI_D3_PIN,
                                                                                     DISPLAY_QSPI_H_RES * 80 * sizeof(uint16_t));
         ESP_ERROR_CHECK(spi_bus_initialize(DISPLAY_QSPI_HOST, &screen_bus_config, SPI_DMA_CH_AUTO));
-
 
         ESP_LOGI(TAG, "Initialize IMU SPI bus");
         spi_bus_config_t imu_bus_config = {};
@@ -300,41 +313,9 @@ private:
         ESP_ERROR_CHECK(spi_bus_initialize(IMU_SPI_HOST, &imu_bus_config, SPI_DMA_CH_AUTO));
     }
 
-    // void InitializeIMU() {
-    //     ESP_LOGI(TAG, "Initialize IMU (BMI270)");
-        
-    //     imu_ = new Bmi270Imu(IMU_SPI_HOST, IMU_CS_PIN, IMU_INT_PIN, IMU_INT2_PIN);
-    //     if (!(imu_->Initialize())) {
-    //         ESP_LOGE(TAG, "Failed to initialize BMI270");
-    //         delete imu_;
-    //         imu_ = nullptr;
-    //         return;
-    //     }
-    //         // 设置任意运动检测参数
-    //     imu_->SetAnyMotionConfig(0x01, 0x0A);  // 100ms, 阈值 0x0A
-        
-    //     // 设置敲击检测参数
-    //     imu_->SetTapConfig(true, true, 0);  // 启用单击和双击，最高灵敏度
+    void InitializeIMU(){
 
-    //     // 设置中断回调
-    //     imu_->SetInterruptCallback([this](Bmi270Imu::InterruptType type) {
-    //         // switch (type) {
-    //         //     case Bmi270Imu::INTERRUPT_ANY_MOTION:
-    //         //         ESP_LOGI(TAG, "Any motion detected");
-    //         //         auto& app = Application::GetInstance();
-    //         //         app.PlaySound("aec_toggle");
-    //         //         break;
-                    
-    //         //     case Bmi270Imu::INTERRUPT_SINGLE_TAP:
-    //         //     case Bmi270Imu::INTERRUPT_DOUBLE_TAP:
-    //         //         ESP_LOGI(TAG, "Tap detected");
-    //         //         if (power_save_timer_) {
-    //         //             power_save_timer_->WakeUp();
-    //         //         }
-    //         //         break;
-    //         // }
-    //     });
-    // }
+    }
 
     void InitializeButtons() {
         boot_button_.OnClick([this]() {

@@ -16,8 +16,8 @@ enum PowerSupply {
 #define AUDIO_I2S_GPIO_MCLK         GPIO_NUM_25
 #define AUDIO_I2S_GPIO_WS           GPIO_NUM_24
 #define AUDIO_I2S_GPIO_BCLK         GPIO_NUM_11
-#define AUDIO_I2S_GPIO_DIN          GPIO_NUM_12
-#define AUDIO_I2S_GPIO_DOUT         GPIO_NUM_23
+#define AUDIO_I2S_GPIO_DIN          GPIO_NUM_23
+#define AUDIO_I2S_GPIO_DOUT         GPIO_NUM_12
 
 #define AUDIO_CODEC_PA_PIN          GPIO_NUM_5
 #define AUDIO_CODEC_I2C_SDA_PIN     GPIO_NUM_26
