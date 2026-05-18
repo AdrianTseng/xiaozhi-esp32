@@ -24,6 +24,7 @@
 
 
 #define TAG "CaiCaiAECBoard"
+#define AUDIO_INPUT_REFERENCE true
 
 static const st77916_lcd_init_cmd_t lcd_init_cmds[] = {
     {0xF0, (uint8_t []){0x28}, 1, 0},
@@ -235,7 +236,6 @@ private:
                     power_save_timer_->SetEnabled(true);
                 }
             }
-
         });
     }
 
@@ -243,12 +243,12 @@ private:
         power_save_timer_ = new PowerSaveTimer(240, 45, 180);
         power_save_timer_->OnEnterSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(true);
-            GetBacklight()->RestoreBrightness();
+            GetBacklight()->SetBrightness(1, false);
             bmi2_set_adv_power_save(BMI2_ENABLE, imu_dev_);
         });
         power_save_timer_->OnExitSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(false);
-            GetBacklight()->SetBrightness(0, false);
+            GetBacklight()->RestoreBrightness();
             bmi2_set_adv_power_save(BMI2_DISABLE, imu_dev_);
         });
         power_save_timer_->OnShutdownRequest([this]() {
@@ -471,7 +471,6 @@ private:
                                     DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
     }   
 
-
     void InitializeTools() {
         auto &mcp_server = McpServer::GetInstance();
         mcp_server.AddTool("self.system.reconfigure_wifi",
@@ -511,9 +510,22 @@ public:
     }
 
     virtual AudioCodec* GetAudioCodec() override {
-        static Es8311AudioCodec audio_codec(codec_i2c_bus_, I2C_NUM_0, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
-            AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN,
-            AUDIO_CODEC_PA_PIN, AUDIO_CODEC_ES8311_ADDR);
+        // static Es8311AudioCodec audio_codec(codec_i2c_bus_, I2C_NUM_0, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
+        //     AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN,
+        //     AUDIO_CODEC_PA_PIN, AUDIO_CODEC_ES8311_ADDR);
+        static BoxAudioCodec audio_codec(
+            codec_i2c_bus_,
+            AUDIO_INPUT_SAMPLE_RATE,
+            AUDIO_OUTPUT_SAMPLE_RATE,
+            AUDIO_I2S_GPIO_MCLK,
+            AUDIO_I2S_GPIO_BCLK,
+            AUDIO_I2S_GPIO_WS,
+            AUDIO_I2S_GPIO_DOUT,
+            AUDIO_I2S_GPIO_DIN,
+            AUDIO_CODEC_PA_PIN,
+            AUDIO_CODEC_ES8311_ADDR,
+            AUDIO_CODEC_ES7210_ADDR,
+            AUDIO_INPUT_REFERENCE);
         return &audio_codec;
     }
 
@@ -522,6 +534,13 @@ public:
         discharging = adc_battery_monitor_->IsDischarging();
         level = adc_battery_monitor_->GetBatteryLevel();
         return true;
+    }
+
+    virtual void SetPowerSaveLevel(PowerSaveLevel level) override {
+        if (level != PowerSaveLevel::LOW_POWER) {
+            power_save_timer_->WakeUp();
+        }
+        WifiBoard::SetPowerSaveLevel(level);
     }
 };
 
