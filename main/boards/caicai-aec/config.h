@@ -68,5 +68,4 @@
 
 #define XCLK_FREQ_HZ                    20000000
 
-
 #endif // _BOARD_CONFIG_H_

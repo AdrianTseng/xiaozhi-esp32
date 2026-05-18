@@ -83,9 +83,6 @@ public:
     virtual void SetPowerSaveLevel(PowerSaveLevel level) = 0;
     virtual std::string GetBoardJson() = 0;
     virtual std::string GetDeviceStatusJson() = 0;
-    virtual i2c_master_dev_handle_t* GetImuI2cHandle(){
-        return nullptr;
-    }
 };
 
 #define DECLARE_BOARD(BOARD_CLASS_NAME) \

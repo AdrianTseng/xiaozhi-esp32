@@ -10,6 +10,7 @@
 #include "power_save_timer.h"
 #include "adc_battery_monitor.h"
 #include "sleep_timer.h"
+#include "bmi270_api.h"
 
 #include <esp_log.h>
 #include <driver/i2c_master.h>
@@ -20,8 +21,6 @@
 #include <driver/rtc_io.h>
 #include <driver/gpio.h>
 #include <esp_sleep.h>
-#include <bmi270.hpp>
-// #include <i2c.hpp>
 
 
 
@@ -217,14 +216,14 @@ static const st77916_lcd_init_cmd_t lcd_init_cmds[] = {
 
 class CaiCaiAECBoard : public WifiBoard {
 private:
-    i2c_master_bus_handle_t codec_i2c_bus_, imu_i2c_bus_;
-    espp::Bmi270<>* imu_;
-    i2c_master_dev_handle_t imu_i2c_dev_;
+    i2c_master_bus_handle_t codec_i2c_bus_;
+    i2c_bus_handle_t imu_i2c_bus_;
+    bmi270_handle_t imu_dev_;
     Button boot_button_, any_motion_button_;
     Display* display_;
-
     PowerSaveTimer* power_save_timer_ = nullptr;
     AdcBatteryMonitor* adc_battery_monitor_ = nullptr;
+    int64_t last_wakeup_time_ = 0;
 
     void InitializeBatteryMonitor() {
         // 后面可以更改这里
@@ -277,30 +276,6 @@ private:
             },
         };
         ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &codec_i2c_bus_));
-
-        // 2. 新增 BMI270 的 I2C 总线初始化 (I2C_NUM_1)
-        i2c_master_bus_config_t bmi270_i2c_bus_cfg = {
-            .i2c_port = (i2c_port_t)I2C_NUM_1,
-            .sda_io_num = IMU_I2C_SDA_PIN,
-            .scl_io_num = IMU_I2C_SCL_PIN,
-            .clk_source = I2C_CLK_SRC_DEFAULT,
-            .glitch_ignore_cnt = 7,
-            .intr_priority = 0,
-            .trans_queue_depth = 0,
-            .flags = {
-                .enable_internal_pullup = 1,
-            },
-        };
-        ESP_ERROR_CHECK(i2c_new_master_bus(&bmi270_i2c_bus_cfg, &imu_i2c_bus_));
-
-        // ScanI2CBus();
-
-        i2c_device_config_t imu_cfg = {
-            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-            .device_address = 0x68,
-            .scl_speed_hz = 400000,
-        };
-        ESP_ERROR_CHECK(i2c_master_bus_add_device(imu_i2c_bus_, &imu_cfg, &imu_i2c_dev_));
     }
 
     void InitializeSpi() {
@@ -313,77 +288,114 @@ private:
         ESP_ERROR_CHECK(spi_bus_initialize(DISPLAY_QSPI_HOST, &screen_bus_config, SPI_DMA_CH_AUTO));
     }
 
-    void ScanI2CBus() { 
-        ESP_LOGI(TAG, "Scaning I2C Bus...");
-        uint8_t address;
-        esp_err_t ret;
-        int device_count = 0;
-
-        for(address = 0x08; address < 0x78; address++){
-            i2c_master_dev_handle_t dev_handle;
-            i2c_device_config_t dev_cfg = {
-                .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-                .device_address = address,
-                .scl_speed_hz = 100000,
-            };
-            ret = i2c_master_bus_add_device(imu_i2c_bus_, &dev_cfg, &dev_handle);
-            if(ret == ESP_OK){
-                uint8_t data;
-                ret = i2c_master_receive(dev_handle, &data, 1, 1000 / portTICK_PERIOD_MS);
-                if (ret == ESP_OK || ret == ESP_ERR_TIMEOUT) {
-                    // 设备响应了
-                    ESP_LOGI(TAG, "Device found at 0x%02X\n", address);
-                    device_count++;
-                }
-                // 从总线移除设备
-                i2c_master_bus_rm_device(dev_handle);
-            }
-        }
-    }
-
     void InitializeIMU(){
-        espp::Bmi270<>::Config config{
-            .device_address = espp::Bmi270<>::DEFAULT_ADDRESS,
-            .write = [this](uint8_t addr, const uint8_t* data, size_t len) {
-                auto dev_ = Board::GetInstance().GetImuI2cHandle();
-                esp_err_t ret = i2c_master_transmit(*dev_, data, len, 1000 / portTICK_PERIOD_MS);
-                return ret == ESP_OK;
-            },
-            .read = [this](uint8_t addr, uint8_t* data, size_t len) {
-                auto dev_ = Board::GetInstance().GetImuI2cHandle();
-                esp_err_t ret = i2c_master_receive(*dev_, data, len, 1000 / portTICK_PERIOD_MS);
-                return ret == ESP_OK;
-            },
-            .imu_config = {
-                .accelerometer_range = espp::Bmi270<>::AccelerometerRange::RANGE_4G,
-                .accelerometer_odr = espp::Bmi270<>::AccelerometerODR::ODR_100_HZ,
-                .gyroscope_range = espp::Bmi270<>::GyroscopeRange::RANGE_1000DPS,
-                .gyroscope_odr = espp::Bmi270<>::GyroscopeODR::ODR_100_HZ,
+        const i2c_config_t i2c_bus_conf = {
+            .mode = I2C_MODE_MASTER,
+            .sda_io_num = IMU_I2C_SDA_PIN,
+            .scl_io_num = IMU_I2C_SCL_PIN,
+            .sda_pullup_en = GPIO_PULLUP_ENABLE,
+            .scl_pullup_en = GPIO_PULLUP_ENABLE,
+            .master = {
+                .clk_speed = 100000,
             }
         };
-        
-        imu_ = new espp::Bmi270<>(config);
 
-        espp::Bmi270<>::InterruptConfig int_config{
-            .pin = espp::Bmi270<>::InterruptPin::INT1,                    ///< Which interrupt pin to use
-            .output_type = espp::Bmi270<>::InterruptOutput::PUSH_PULL,  ///< Output type
-            .active_level = espp::Bmi270<>::InterruptLevel::ACTIVE_HIGH, ///< Active level
-            .latch_mode = false,                                   ///< Latch interrupt until cleared
-            .enable_data_ready = false,                            ///< Enable data ready interrupt
-            .enable_fifo_watermark = false,                        ///< Enable FIFO watermark interrupt
-            .enable_fifo_full = false,                             ///< Enable FIFO full interrupt
-            .enable_any_motion = true,                            ///< Enable any motion interrupt
-            .enable_no_motion = false,                             ///< Enable no motion interrupt
-            .enable_significant_motion = false, ///< Enable significant motion interrupt
-            .enable_step_detector = false,      ///< Enable step detector interrupt
-            .enable_wrist_wear_wakeup = false,  ///< Enable wrist wear wakeup interrupt
-        };
+        imu_i2c_bus_ = i2c_bus_create(I2C_NUM_1, &i2c_bus_conf);
+        ESP_ERROR_CHECK(bmi270_sensor_create(imu_i2c_bus_, &imu_dev_, bmi270_toy_config_file, 0));
 
-        // std::error_code ec;
-        // imu_->configure_interrupts(int_config, ec);
-        // imu_->enable_advanced_features(true, ec);
+        int8_t rslt;
+        struct bmi2_sens_config config[2];
+        struct bmi2_int_pin_config pin_config = { 0 };
+
+        config[BMI2_ACCEL].type = BMI2_ACCEL;
+        config[BMI2_GYRO].type = BMI2_GYRO;
+
+        bmi2_soft_reset(imu_dev_);
+
+        rslt = bmi2_get_int_pin_config(&pin_config, imu_dev_);
+        bmi2_error_codes_print_result(rslt);
+
+        rslt = bmi2_get_sensor_config(config, 2, imu_dev_);
+        bmi2_error_codes_print_result(rslt);
+
+        if(rslt != BMI2_OK){
+            ESP_LOGE(TAG, "Failed to get sensor config");
+            return;
+        }
+
+        /* Configure accelerometer output data rate */
+        config[BMI2_ACCEL].cfg.acc.odr = BMI2_ACC_ODR_100HZ;        /* 100Hz sampling rate */
+        config[BMI2_ACCEL].cfg.acc.range = BMI2_ACC_RANGE_4G;      /* ±4G range */
+        config[BMI2_ACCEL].cfg.acc.bwp = BMI2_ACC_NORMAL_AVG4;      /* Standard averaging */
+        config[BMI2_ACCEL].cfg.acc.filter_perf = BMI2_PERF_OPT_MODE; /* Filter performance */
+
+        /* Configure gyroscope output data rate */
+        config[BMI2_GYRO].cfg.gyr.odr = BMI2_GYR_ODR_100HZ;         /* 100Hz sampling rate */
+        config[BMI2_GYRO].cfg.gyr.range = BMI2_GYR_RANGE_500;      /* ±500dps range */
+        config[BMI2_GYRO].cfg.gyr.bwp = BMI2_GYR_NORMAL_MODE;       /* Standard filtering */
+        config[BMI2_GYRO].cfg.gyr.noise_perf = BMI2_PERF_OPT_MODE;  /* Noise performance */
+        config[BMI2_GYRO].cfg.gyr.filter_perf = BMI2_PERF_OPT_MODE; /* Filter performance */
+
+        rslt = bmi2_set_sensor_config(config, 2, imu_dev_);
+        bmi2_error_codes_print_result(rslt);
+        if(rslt != BMI2_OK){
+            ESP_LOGE(TAG, "Failed to set accel & gyro configs.");
+            return;
+        }
+
+        pin_config.pin_type = BMI2_INT2;
+        pin_config.pin_cfg[1].input_en = BMI2_INT_INPUT_DISABLE;
+        pin_config.pin_cfg[1].lvl = BMI2_INT_ACTIVE_HIGH; // High level trigger as requested
+        pin_config.pin_cfg[1].od = BMI2_INT_PUSH_PULL;
+        pin_config.pin_cfg[1].output_en = BMI2_INT_OUTPUT_ENABLE;
+        pin_config.int_latch = BMI2_INT_NON_LATCH; // Non-latched so it goes low after event is cleared or read
+
+        rslt = bmi2_set_int_pin_config(&pin_config, imu_dev_);
+        bmi2_error_codes_print_result(rslt);
+        if(rslt != BMI2_OK){
+            ESP_LOGE(TAG, "Failed to set interrupt pin config.");
+            return;
+        }
+
+        // Map Any-Motion interrupt to INT2
+        uint8_t data = BMI270_TOY_INT_ANY_MOT_MASK;
+        // BMI2_INT2_MAP_FEAT_ADDR is typically 0x58 for INT2 feature mapping in BMI270
+        rslt = bmi2_set_regs(BMI2_INT2_MAP_FEAT_ADDR, &data, 1, imu_dev_);
+        bmi2_error_codes_print_result(rslt);
+        if(rslt != BMI2_OK){
+            ESP_LOGE(TAG, "Failed to set interrupt feature pin-map config.");
+            return;
+        }
+
+        uint8_t sens_list[2] = { BMI2_ACCEL, BMI2_GYRO };
+        // Enable sensors
+        rslt = bmi2_sensor_enable(sens_list, 2, imu_dev_);
+        bmi2_error_codes_print_result(rslt);
+        if(rslt != BMI2_OK){
+            ESP_LOGE(TAG, "Failed to enable sensors.");
+            return;
+        }
+
+        // Enable any-motion feature
+        rslt = bmi270_enable_toy_any_motion(imu_dev_, BMI2_ENABLE);
+        bmi2_error_codes_print_result(rslt);
+        if(rslt != BMI2_OK){
+            ESP_LOGE(TAG, "Failed to enable any-motion feature.");
+            return;
+        }
+        else{
+            ESP_LOGI(TAG, "Any-motion feature enabled, result: %d", rslt);
+        }
+
+        // Clear any pending interrupts
+        // uint8_t int_status;
+        // rslt = bmi2_get_regs(BMI2_INT_STATUS_0_ADDR, &int_status, 1, imu_dev_);
+        // bmi2_error_codes_print_result(rslt);
+        // rslt = bmi2_get_regs(BMI2_INT_STATUS_1_ADDR, &int_status, 1, imu_dev_);
+        // bmi2_error_codes_print_result(rslt);
     }
 
+    
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
@@ -401,10 +413,21 @@ private:
             }
         });
 
-        any_motion_button_.OnClick([this]() {
-            ESP_LOGI(TAG, "motion detected.");
-            power_save_timer_->WakeUp();
+        any_motion_button_.OnPressDown([this](){
+            uint8_t int_status;
+            bmi2_get_regs(BMI2_INT_STATUS_0_ADDR, &int_status, 1, imu_dev_);
+            if(int_status & BMI270_TOY_INT_ANY_MOT_MASK){
+                int64_t current_time = esp_timer_get_time();
+                if(current_time - last_wakeup_time_> 10000000){
+                    power_save_timer_ -> WakeUp();
+                    last_wakeup_time_ = current_time;
+                }
+            }
         });
+        // any_motion_button_.OnClick([this]() {
+        //     ESP_LOGI(TAG, "motion detected.");
+        //     power_save_timer_->WakeUp();
+        // });
 
 #if CONFIG_USE_DEVICE_AEC
         boot_button_.OnDoubleClick([this]() {
@@ -468,12 +491,12 @@ private:
     }
 
 public:
-    CaiCaiAECBoard() : boot_button_(BOOT_BUTTON_GPIO), any_motion_button_(IMU_INT_PIN, true) {
+    CaiCaiAECBoard() : boot_button_(BOOT_BUTTON_GPIO), any_motion_button_(IMU_INT2_PIN, true) {
         InitializeI2c();
         InitializeSpi();
         InitializeBatteryMonitor();
         InitializePowerSaveTimer();
-        // InitializeIMU();
+        InitializeIMU();
         InitializeSt77916Display();
         InitializeButtons();
         InitializeTools();
@@ -506,10 +529,6 @@ public:
         discharging = adc_battery_monitor_->IsDischarging();
         level = adc_battery_monitor_->GetBatteryLevel();
         return true;
-    }
-
-    virtual i2c_master_dev_handle_t* GetImuI2cHandle() override {
-        return &imu_i2c_dev_;
     }
 };
 
