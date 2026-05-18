@@ -23,7 +23,6 @@
 #include <esp_sleep.h>
 
 
-
 #define TAG "CaiCaiAECBoard"
 
 static const st77916_lcd_init_cmd_t lcd_init_cmds[] = {
@@ -241,7 +240,7 @@ private:
     }
 
     void InitializePowerSaveTimer() {
-        power_save_timer_ = new PowerSaveTimer(240, 30, 60);
+        power_save_timer_ = new PowerSaveTimer(240, 45, 180);
         power_save_timer_->OnEnterSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(true);
             GetBacklight()->RestoreBrightness();
@@ -392,13 +391,6 @@ private:
         else{
             ESP_LOGI(TAG, "Any-motion feature enabled, result: %d", rslt);
         }
-
-        // Clear any pending interrupts
-        // uint8_t int_status;
-        // rslt = bmi2_get_regs(BMI2_INT_STATUS_0_ADDR, &int_status, 1, imu_dev_);
-        // bmi2_error_codes_print_result(rslt);
-        // rslt = bmi2_get_regs(BMI2_INT_STATUS_1_ADDR, &int_status, 1, imu_dev_);
-        // bmi2_error_codes_print_result(rslt);
     }
 
     
@@ -418,7 +410,7 @@ private:
             bmi2_get_regs(BMI2_INT_STATUS_0_ADDR, &int_status, 1, imu_dev_);
             if(int_status & BMI270_TOY_INT_ANY_MOT_MASK){
                 int64_t current_time = esp_timer_get_time();
-                if(current_time - last_wakeup_time_> 10000000){
+                if(current_time - last_wakeup_time_> 15000000){
                     ESP_LOGI(TAG, "Wake up by any motion.");
                     power_save_timer_ -> WakeUp();
                     last_wakeup_time_ = current_time;
