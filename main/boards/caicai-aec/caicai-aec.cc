@@ -10,7 +10,6 @@
 #include "power_save_timer.h"
 #include "adc_battery_monitor.h"
 #include "sleep_timer.h"
-#include "led/single_led.h"
 
 #include <esp_log.h>
 #include <driver/i2c_master.h>
@@ -21,6 +20,8 @@
 #include <driver/rtc_io.h>
 #include <driver/gpio.h>
 #include <esp_sleep.h>
+#include <bmi270.hpp>
+// #include <i2c.hpp>
 
 
 
@@ -218,8 +219,8 @@ class CaiCaiAECBoard : public WifiBoard {
 private:
     i2c_master_bus_handle_t codec_i2c_bus_, imu_i2c_bus_;
     espp::Bmi270<>* imu_;
-    Button boot_button_;
-    Button *any_motion_button_, *tap_button_;
+    i2c_master_dev_handle_t imu_i2c_dev_;
+    Button boot_button_, any_motion_button_;
     Display* display_;
 
     PowerSaveTimer* power_save_timer_ = nullptr;
@@ -227,7 +228,7 @@ private:
 
     void InitializeBatteryMonitor() {
         // 后面可以更改这里
-        adc_battery_monitor_ = new AdcBatteryMonitor(ADC_UNIT_1, ADC_CHANNEL_2, 200000, 100000, GPIO_NUM_NC);
+        adc_battery_monitor_ = new AdcBatteryMonitor(ADC_UNIT_1, ADC_CHANNEL_2, 200000, 100000, CHARGIN_DETECT_PIN);
         adc_battery_monitor_->OnChargingStatusChanged([this](bool is_charging) {
             if (power_save_timer_ != nullptr){
                 if (is_charging) {
@@ -277,20 +278,29 @@ private:
         };
         ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &codec_i2c_bus_));
 
-        // // 2. 新增 BMI270 的 I2C 总线初始化 (I2C_NUM_1)
-        // i2c_master_bus_config_t bmi270_i2c_bus_cfg = {
-        //     .i2c_port = (i2c_port_t)I2C_NUM_1,
-        //     .sda_io_num = IMU_I2C_SDA_PIN,
-        //     .scl_io_num = IMU_I2C_SCL_PIN,
-        //     .clk_source = I2C_CLK_SRC_DEFAULT,
-        //     .glitch_ignore_cnt = 7,
-        //     .intr_priority = 0,
-        //     .trans_queue_depth = 0,
-        //     .flags = {
-        //         .enable_internal_pullup = 1,
-        //     },
-        // };
-        // ESP_ERROR_CHECK(i2c_new_master_bus(&bmi270_i2c_bus_cfg, &imu_i2c_bus_));
+        // 2. 新增 BMI270 的 I2C 总线初始化 (I2C_NUM_1)
+        i2c_master_bus_config_t bmi270_i2c_bus_cfg = {
+            .i2c_port = (i2c_port_t)I2C_NUM_1,
+            .sda_io_num = IMU_I2C_SDA_PIN,
+            .scl_io_num = IMU_I2C_SCL_PIN,
+            .clk_source = I2C_CLK_SRC_DEFAULT,
+            .glitch_ignore_cnt = 7,
+            .intr_priority = 0,
+            .trans_queue_depth = 0,
+            .flags = {
+                .enable_internal_pullup = 1,
+            },
+        };
+        ESP_ERROR_CHECK(i2c_new_master_bus(&bmi270_i2c_bus_cfg, &imu_i2c_bus_));
+
+        // ScanI2CBus();
+
+        i2c_device_config_t imu_cfg = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = 0x68,
+            .scl_speed_hz = 400000,
+        };
+        ESP_ERROR_CHECK(i2c_master_bus_add_device(imu_i2c_bus_, &imu_cfg, &imu_i2c_dev_));
     }
 
     void InitializeSpi() {
@@ -301,20 +311,77 @@ private:
                                                                                     DISPLAY_QSPI_D3_PIN,
                                                                                     DISPLAY_QSPI_H_RES * 80 * sizeof(uint16_t));
         ESP_ERROR_CHECK(spi_bus_initialize(DISPLAY_QSPI_HOST, &screen_bus_config, SPI_DMA_CH_AUTO));
+    }
 
-        ESP_LOGI(TAG, "Initialize IMU SPI bus");
-        spi_bus_config_t imu_bus_config = {};
-        imu_bus_config.mosi_io_num = IMU_SPI_MOSI_PIN;
-        imu_bus_config.miso_io_num = IMU_SPI_MISO_PIN;
-        imu_bus_config.sclk_io_num = IMU_SPI_SCK_PIN;
-        imu_bus_config.quadwp_io_num = GPIO_NUM_NC;
-        imu_bus_config.quadhd_io_num = GPIO_NUM_NC;
-        imu_bus_config.max_transfer_sz = 256;
-        ESP_ERROR_CHECK(spi_bus_initialize(IMU_SPI_HOST, &imu_bus_config, SPI_DMA_CH_AUTO));
+    void ScanI2CBus() { 
+        ESP_LOGI(TAG, "Scaning I2C Bus...");
+        uint8_t address;
+        esp_err_t ret;
+        int device_count = 0;
+
+        for(address = 0x08; address < 0x78; address++){
+            i2c_master_dev_handle_t dev_handle;
+            i2c_device_config_t dev_cfg = {
+                .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+                .device_address = address,
+                .scl_speed_hz = 100000,
+            };
+            ret = i2c_master_bus_add_device(imu_i2c_bus_, &dev_cfg, &dev_handle);
+            if(ret == ESP_OK){
+                uint8_t data;
+                ret = i2c_master_receive(dev_handle, &data, 1, 1000 / portTICK_PERIOD_MS);
+                if (ret == ESP_OK || ret == ESP_ERR_TIMEOUT) {
+                    // 设备响应了
+                    ESP_LOGI(TAG, "Device found at 0x%02X\n", address);
+                    device_count++;
+                }
+                // 从总线移除设备
+                i2c_master_bus_rm_device(dev_handle);
+            }
+        }
     }
 
     void InitializeIMU(){
+        espp::Bmi270<>::Config config{
+            .device_address = espp::Bmi270<>::DEFAULT_ADDRESS,
+            .write = [this](uint8_t addr, const uint8_t* data, size_t len) {
+                auto dev_ = Board::GetInstance().GetImuI2cHandle();
+                esp_err_t ret = i2c_master_transmit(*dev_, data, len, 1000 / portTICK_PERIOD_MS);
+                return ret == ESP_OK;
+            },
+            .read = [this](uint8_t addr, uint8_t* data, size_t len) {
+                auto dev_ = Board::GetInstance().GetImuI2cHandle();
+                esp_err_t ret = i2c_master_receive(*dev_, data, len, 1000 / portTICK_PERIOD_MS);
+                return ret == ESP_OK;
+            },
+            .imu_config = {
+                .accelerometer_range = espp::Bmi270<>::AccelerometerRange::RANGE_4G,
+                .accelerometer_odr = espp::Bmi270<>::AccelerometerODR::ODR_100_HZ,
+                .gyroscope_range = espp::Bmi270<>::GyroscopeRange::RANGE_1000DPS,
+                .gyroscope_odr = espp::Bmi270<>::GyroscopeODR::ODR_100_HZ,
+            }
+        };
+        
+        imu_ = new espp::Bmi270<>(config);
 
+        espp::Bmi270<>::InterruptConfig int_config{
+            .pin = espp::Bmi270<>::InterruptPin::INT1,                    ///< Which interrupt pin to use
+            .output_type = espp::Bmi270<>::InterruptOutput::PUSH_PULL,  ///< Output type
+            .active_level = espp::Bmi270<>::InterruptLevel::ACTIVE_HIGH, ///< Active level
+            .latch_mode = false,                                   ///< Latch interrupt until cleared
+            .enable_data_ready = false,                            ///< Enable data ready interrupt
+            .enable_fifo_watermark = false,                        ///< Enable FIFO watermark interrupt
+            .enable_fifo_full = false,                             ///< Enable FIFO full interrupt
+            .enable_any_motion = true,                            ///< Enable any motion interrupt
+            .enable_no_motion = false,                             ///< Enable no motion interrupt
+            .enable_significant_motion = false, ///< Enable significant motion interrupt
+            .enable_step_detector = false,      ///< Enable step detector interrupt
+            .enable_wrist_wear_wakeup = false,  ///< Enable wrist wear wakeup interrupt
+        };
+
+        // std::error_code ec;
+        // imu_->configure_interrupts(int_config, ec);
+        // imu_->enable_advanced_features(true, ec);
     }
 
     void InitializeButtons() {
@@ -332,6 +399,11 @@ private:
             if(power_save_timer_){
                 power_save_timer_->WakeUp();
             }
+        });
+
+        any_motion_button_.OnClick([this]() {
+            ESP_LOGI(TAG, "motion detected.");
+            power_save_timer_->WakeUp();
         });
 
 #if CONFIG_USE_DEVICE_AEC
@@ -396,19 +468,22 @@ private:
     }
 
 public:
-    CaiCaiAECBoard() : boot_button_(BOOT_BUTTON_GPIO) {
+    CaiCaiAECBoard() : boot_button_(BOOT_BUTTON_GPIO), any_motion_button_(IMU_INT_PIN, true) {
         InitializeI2c();
         InitializeSpi();
+        InitializeBatteryMonitor();
+        InitializePowerSaveTimer();
+        // InitializeIMU();
         InitializeSt77916Display();
         InitializeButtons();
         InitializeTools();
         GetBacklight()->RestoreBrightness();
     }
 
-    virtual Led* GetLed() override {
-        static SingleLed led_strip(BUILTIN_LED_GPIO);
-        return &led_strip;
-    }
+    // virtual Led* GetLed() override {
+    //     static SingleLed led_strip(BUILTIN_LED_GPIO);
+    //     return &led_strip;
+    // }
 
     virtual Display* GetDisplay() override {
         return display_;
@@ -431,6 +506,10 @@ public:
         discharging = adc_battery_monitor_->IsDischarging();
         level = adc_battery_monitor_->GetBatteryLevel();
         return true;
+    }
+
+    virtual i2c_master_dev_handle_t* GetImuI2cHandle() override {
+        return &imu_i2c_dev_;
     }
 };
 

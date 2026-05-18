@@ -8,6 +8,7 @@
 #include <string>
 #include <functional>
 #include <network_interface.h>
+#include <driver/i2c_master.h>
 
 #include "led/led.h"
 #include "backlight.h"
@@ -82,6 +83,9 @@ public:
     virtual void SetPowerSaveLevel(PowerSaveLevel level) = 0;
     virtual std::string GetBoardJson() = 0;
     virtual std::string GetDeviceStatusJson() = 0;
+    virtual i2c_master_dev_handle_t* GetImuI2cHandle(){
+        return nullptr;
+    }
 };
 
 #define DECLARE_BOARD(BOARD_CLASS_NAME) \
