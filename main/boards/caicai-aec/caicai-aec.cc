@@ -241,20 +241,26 @@ private:
     }
 
     void InitializePowerSaveTimer() {
-        power_save_timer_ = new PowerSaveTimer(240, 30, 180);
+        power_save_timer_ = new PowerSaveTimer(240, 30, 60);
         power_save_timer_->OnEnterSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(true);
+            GetBacklight()->RestoreBrightness();
+            bmi2_set_adv_power_save(BMI2_ENABLE, imu_dev_);
         });
         power_save_timer_->OnExitSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(false);
+            GetBacklight()->SetBrightness(0, false);
+            bmi2_set_adv_power_save(BMI2_DISABLE, imu_dev_);
         });
         power_save_timer_->OnShutdownRequest([this]() {
             auto& app = Application::GetInstance();
             GetDisplay()->SetPowerSaveMode(true);
             while(!app.CanEnterSleepMode()){
-                vTaskDelay(pdMS_TO_TICKS(200));
+                vTaskDelay(pdMS_TO_TICKS(100));
             }
             GetBacklight()->SetBrightness(0, false);
+            ESP_LOGI(TAG, "Shuting down...");
+            vTaskDelay(pdMS_TO_TICKS(100));
             esp_sleep_enable_ext0_wakeup(IMU_INT2_PIN, 1);
             esp_deep_sleep_start();
         });
@@ -407,18 +413,13 @@ private:
             app.ToggleChatState();
         });
 
-        boot_button_.OnPressDown([this](){
-            if(power_save_timer_){
-                power_save_timer_->WakeUp();
-            }
-        });
-
         any_motion_button_.OnPressDown([this](){
             uint8_t int_status;
             bmi2_get_regs(BMI2_INT_STATUS_0_ADDR, &int_status, 1, imu_dev_);
             if(int_status & BMI270_TOY_INT_ANY_MOT_MASK){
                 int64_t current_time = esp_timer_get_time();
                 if(current_time - last_wakeup_time_> 10000000){
+                    ESP_LOGI(TAG, "Wake up by any motion.");
                     power_save_timer_ -> WakeUp();
                     last_wakeup_time_ = current_time;
                 }
