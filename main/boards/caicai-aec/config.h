@@ -17,6 +17,7 @@
 #define AUDIO_CODEC_I2C_SCL_PIN         GPIO_NUM_47
 #define AUDIO_CODEC_ES8311_ADDR         ES8311_CODEC_DEFAULT_ADDR
 #define AUDIO_CODEC_ES7210_ADDR         ES7210_CODEC_DEFAULT_ADDR
+#define AUDIO_INPUT_REFERENCE true
 
 #define IMU_I2C_SCL_PIN                 GPIO_NUM_15
 #define IMU_I2C_SDA_PIN                 GPIO_NUM_7
@@ -67,5 +68,9 @@
     }
 
 #define XCLK_FREQ_HZ                    20000000
+
+#define ML307_RX_PIN                    GPIO_NUM_43
+#define ML307_TX_PIN                    GPIO_NUM_44
+// #define USE_EMOTE_DISPLAY               1
 
 #endif // _BOARD_CONFIG_H_

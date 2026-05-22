@@ -1,16 +1,18 @@
-#include "wifi_board.h"
+#include "dual_network_board.h"
 #include "codecs/es8311_audio_codec.h"
 #include "codecs/box_audio_codec.h"
+#include "display/emote_display.h"
 #include "display/lcd_display.h"
 #include "application.h"
 #include "button.h"
-#include "config.h"
+
 #include "i2c_device.h"
 #include "mcp_server.h"
 #include "power_save_timer.h"
 #include "adc_battery_monitor.h"
 #include "sleep_timer.h"
 #include "bmi270_api.h"
+#include "config.h"
 
 #include <esp_log.h>
 #include <driver/i2c_master.h>
@@ -18,13 +20,17 @@
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_st77916.h>
+#include <wifi_manager.h>
 #include <driver/rtc_io.h>
 #include <driver/gpio.h>
 #include <esp_sleep.h>
 
 
 #define TAG "CaiCaiAECBoard"
-#define AUDIO_INPUT_REFERENCE true
+
+#ifdef USE_EMOTE_DISPLAY
+using namespace emote;
+#endif
 
 static const st77916_lcd_init_cmd_t lcd_init_cmds[] = {
     {0xF0, (uint8_t []){0x28}, 1, 0},
@@ -214,12 +220,14 @@ static const st77916_lcd_init_cmd_t lcd_init_cmds[] = {
 };
 
 
-class CaiCaiAECBoard : public WifiBoard {
+class CaiCaiAECBoard : public DualNetworkBoard {
 private:
     i2c_master_bus_handle_t codec_i2c_bus_;
     i2c_bus_handle_t imu_i2c_bus_;
     bmi270_handle_t imu_dev_;
     Button boot_button_, any_motion_button_;
+    esp_lcd_panel_io_handle_t panel_io = nullptr;
+    esp_lcd_panel_handle_t panel = nullptr;
     Display* display_;
     PowerSaveTimer* power_save_timer_ = nullptr;
     AdcBatteryMonitor* adc_battery_monitor_ = nullptr;
@@ -398,11 +406,21 @@ private:
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
             // During startup (before connected), pressing BOOT button enters Wi-Fi config mode without reboot
-            if (app.GetDeviceState() == kDeviceStateStarting) {
-                EnterWifiConfigMode();
+            if (app.GetDeviceState() == kDeviceStateStarting && !WifiManager::GetInstance().IsConnected()) {
+                auto& wifi_board = static_cast<WifiBoard&>(GetCurrentBoard());
+                wifi_board.EnterWifiConfigMode();
                 return;
             }
             app.ToggleChatState();
+            power_save_timer_ -> WakeUp();
+        });
+
+         boot_button_.OnLongPress([this]() {
+            // auto& app = Application::GetInstance();
+            // if (app.GetDeviceState() == kDeviceStateStarting || app.GetDeviceState() == kDeviceStateWifiConfiguring) {
+            //     SwitchNetworkType();
+            // }
+            SwitchNetworkType();
         });
 
         any_motion_button_.OnPressDown([this](){
@@ -436,8 +454,7 @@ private:
     // St77916 初始化
     void InitializeSt77916Display() {
         ESP_LOGI(TAG, "Init St77916 display");
-        esp_lcd_panel_io_handle_t panel_io = nullptr;
-        esp_lcd_panel_handle_t panel = nullptr;
+    
         ESP_LOGI(TAG, "Install panel IO");
         
         esp_lcd_panel_io_spi_config_t io_config = ST77916_PANEL_IO_QSPI_CONFIG(DISPLAY_QSPI_CS_PIN, NULL, NULL);
@@ -453,6 +470,7 @@ private:
                 .use_qspi_interface = 1,
             },
         };
+
         const esp_lcd_panel_dev_config_t panel_config = {
             .reset_gpio_num = DISPLAY_QSPI_RESET_PIN,
             .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
@@ -467,8 +485,12 @@ private:
         esp_lcd_panel_swap_xy(panel, DISPLAY_SWAP_XY);
         esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
 
+        #ifdef USE_EMOTE_DISPLAY
+        display_ = new EmoteDisplay(panel, panel_io, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+        #else
         display_ = new SpiLcdDisplay(panel_io, panel,
                                     DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+        #endif
     }   
 
     void InitializeTools() {
@@ -477,19 +499,75 @@ private:
             "End this conversation and enter WiFi configuration mode.\n"
             "**CAUTION** You must ask the user to confirm this action.",
             PropertyList(), [this](const PropertyList& properties) {
-                EnterWifiConfigMode();
+                auto& wifi_board = static_cast<WifiBoard&>(GetCurrentBoard());
+                wifi_board.EnterWifiConfigMode();
                 return true;
             });
+
+        mcp_server.AddTool(
+            "self.AEC.set_mode",
+            "设置AEC对话打断模式。当用户意图切换对话打断模式时或者用户觉得ai对话容易被打断时或者用户觉得无法实现对话打断时都使用此工具。\n"
+            "参数：\n"
+            "   `mode`: 对话打断模式，可选值只有`kAecOff`(关闭）和`kAecOnDeviceSide`（开启）\n"
+            "返回值：\n"
+            "   反馈状态信息，不需要确认，立即播报相关数据\n",
+            PropertyList({
+                Property("mode", kPropertyTypeString)
+            }), 
+            [](const PropertyList& propoerties) -> ReturnValue {
+                auto mode = propoerties["mode"].value<std::string>();
+                auto &app = Application::GetInstance();
+                vTaskDelay(pdMS_TO_TICKS(1500));
+                if(mode == "kAecOff"){
+                    app.SetAecMode(kAecOff);
+                    return "{\"success\":true, \"message\":\"AEC对话打断模式已关闭\"}";
+                }else{
+                    app.SetAecMode(kAecOnDeviceSide);
+                    return "{\"success\":true, \"message\":\"AEC对话打断模式已开启\"}";
+                }
+            }
+        );
+
+        mcp_server.AddTool(
+            "self.AEC.get_mode",
+            "获取AEC对话打断模式状态。当用户意图获取对话打断模式状态时使用此工具。\n"
+            "返回值：\n"
+            "   反馈状态信息，不需要确认，立即播报相关数据\n",
+            PropertyList(),  
+            [](const PropertyList&) -> ReturnValue {
+                auto& app = Application::GetInstance();
+                const bool is_currently_off = (app.GetAecMode() == kAecOff);
+            if (is_currently_off) {
+                    return "{\"success\": true, \"message\": \"AEC对话打断模式处于关闭状态\"}";
+                }else {
+                    return "{\"success\": true, \"message\": \"AEC对话打断模式处于开启状态\"}";
+                }
+            }
+        );
+
+        mcp_server.AddTool(
+            "self.res.esp_restart",
+            "重启设备。当用户意图重启设备时使用此工具。\n",
+            PropertyList(),  
+            [](const PropertyList&) -> ReturnValue {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                // Reboot the device
+                esp_restart();
+                return true;
+            }
+        );
     }
 
 public:
-    CaiCaiAECBoard() : boot_button_(BOOT_BUTTON_GPIO), any_motion_button_(IMU_INT2_PIN, true) {
+    CaiCaiAECBoard() : 
+    DualNetworkBoard(ML307_TX_PIN, ML307_RX_PIN, GPIO_NUM_NC, 0),
+    boot_button_(BOOT_BUTTON_GPIO), any_motion_button_(IMU_INT2_PIN, true) {
         InitializeI2c();
         InitializeSpi();
         InitializeBatteryMonitor();
         InitializePowerSaveTimer();
-        InitializeIMU();
         InitializeSt77916Display();
+        InitializeIMU();
         InitializeButtons();
         InitializeTools();
         GetBacklight()->RestoreBrightness();
@@ -540,7 +618,8 @@ public:
         if (level != PowerSaveLevel::LOW_POWER) {
             power_save_timer_->WakeUp();
         }
-        WifiBoard::SetPowerSaveLevel(level);
+        auto& wifi_board = static_cast<WifiBoard&>(GetCurrentBoard());
+        wifi_board.SetPowerSaveLevel(level);
     }
 };
 
